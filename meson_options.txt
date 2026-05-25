@@ -68,3 +68,8 @@ option('trim_dsp',
     choices: ['true', 'false', 'if-release'],
     value: 'if-release',
     description: 'Eliminate redundant DSP functions where possible')
+
+option('enable_inspect',
+    type: 'boolean',
+    value: true,
+    description: 'Enable frame inspection output (residual maps, block metadata)')

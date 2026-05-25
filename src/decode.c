@@ -32,6 +32,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <math.h>
 
 #include "dav1d/data.h"
 
@@ -50,6 +51,428 @@
 #include "src/tables.h"
 #include "src/thread_task.h"
 #include "src/warpmv.h"
+
+#if CONFIG_INSPECT
+#include <sys/stat.h>
+#include <sys/types.h>
+
+/* ---------- JSON inspection output (libaom/aomanalyzer compatible) ---------- */
+
+/* Growable write buffer for JSON serialization — avoids many small fwrite calls */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+    FILE *fp;      /* flush destination */
+} InspectBuf;
+
+static void ibuf_init(InspectBuf *b, FILE *fp, size_t initial)
+{
+    b->data = (char *)malloc(initial);
+    b->len = 0;
+    b->cap = b->data ? initial : 0;
+    b->fp = fp;
+}
+
+static void ibuf_ensure(InspectBuf *b, size_t need)
+{
+    if (b->len + need <= b->cap) return;
+    /* flush to file if buffer is large enough already */
+    if (b->len > 0 && b->cap >= (1 << 20)) {
+        fwrite(b->data, 1, b->len, b->fp);
+        b->len = 0;
+    }
+    if (b->len + need > b->cap) {
+        size_t newcap = b->cap ? b->cap * 2 : 4096;
+        while (newcap < b->len + need) newcap *= 2;
+        char *nd = (char *)realloc(b->data, newcap);
+        if (!nd) return;
+        b->data = nd;
+        b->cap = newcap;
+    }
+}
+
+static void ibuf_flush(InspectBuf *b)
+{
+    if (b->len > 0) {
+        fwrite(b->data, 1, b->len, b->fp);
+        b->len = 0;
+    }
+}
+
+static void ibuf_free(InspectBuf *b)
+{
+    ibuf_flush(b);
+    free(b->data);
+    b->data = NULL;
+    b->len = b->cap = 0;
+}
+
+static void ibuf_puts(InspectBuf *b, const char *s)
+{
+    size_t n = strlen(s);
+    ibuf_ensure(b, n);
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+}
+
+/* Fast integer-to-string: returns pointer into buf, caller does NOT free */
+static char *i32_to_str(char *end, int32_t v)
+{
+    int neg = 0;
+    uint32_t u;
+    if (v < 0) { neg = 1; u = (uint32_t)(-(int64_t)v); }
+    else u = (uint32_t)v;
+    *--end = '\0';
+    do { *--end = '0' + (u % 10); u /= 10; } while (u);
+    if (neg) *--end = '-';
+    return end;
+}
+
+static void ibuf_int(InspectBuf *b, int32_t v)
+{
+    char tmp[16], *p;
+    p = i32_to_str(tmp + sizeof(tmp), v);
+    ibuf_puts(b, p);
+}
+
+static void ibuf_float(InspectBuf *b, float v)
+{
+    char tmp[32];
+    int len = snprintf(tmp, sizeof(tmp), "%.2f", v);
+    if (len > 0 && len < (int)sizeof(tmp)) {
+        ibuf_ensure(b, len);
+        memcpy(b->data + b->len, tmp, len);
+        b->len += len;
+    }
+}
+
+/*
+ * Write flat (uncompressed) JSON for one frame — matches 0017.json format.
+ * 2D arrays indexed [row][col] over the w4×h4 MI grid.
+ */
+static void write_json_flat(InspectBuf *b, const Dav1dInspectFrameCtx *ctx)
+{
+    const int w4 = ctx->w4;
+    const int h4 = ctx->h4;
+    const ptrdiff_t stride = ctx->b4_stride;
+    const Dav1dInspectBlock *blocks = ctx->blocks;
+
+    /* blockSizeMap (static legend) */
+    ibuf_puts(b, "  \"blockSizeMap\": {\"BLOCK_4X4\":0,\"BLOCK_4X8\":1,\"BLOCK_8X4\":2,"
+              "\"BLOCK_8X8\":3,\"BLOCK_8X16\":4,\"BLOCK_16X8\":5,\"BLOCK_16X16\":6,"
+              "\"BLOCK_16X32\":7,\"BLOCK_32X16\":8,\"BLOCK_32X32\":9,\"BLOCK_32X64\":10,"
+              "\"BLOCK_64X32\":11,\"BLOCK_64X64\":12,\"BLOCK_64X128\":13,"
+              "\"BLOCK_128X64\":14,\"BLOCK_128X128\":15,\"BLOCK_4X16\":16,"
+              "\"BLOCK_16X4\":17,\"BLOCK_8X32\":18,\"BLOCK_32X8\":19,"
+              "\"BLOCK_16X64\":20,\"BLOCK_64X16\":21},\n");
+
+    /* blockSize - flat 2D array */
+    ibuf_puts(b, "  \"blockSize\": [");
+    for (int r = 0; r < h4; r++) {
+        ibuf_puts(b, "[");
+        for (int c = 0; c < w4; c++) {
+            const Dav1dInspectBlock *bl = &blocks[r * stride + c];
+            const uint8_t aom_bs = dav1d_bs_to_aom_bs[bl->block_size];
+            ibuf_int(b, aom_bs);
+            ibuf_puts(b, c < w4 - 1 ? "," : "");
+        }
+        ibuf_puts(b, r < h4 - 1 ? "]," : "]");
+    }
+    ibuf_puts(b, "],\n");
+
+    /* motionVectors */
+    ibuf_puts(b, "  \"motionVectors\": [");
+    for (int r = 0; r < h4; r++) {
+        ibuf_puts(b, "[");
+        for (int c = 0; c < w4; c++) {
+            const Dav1dInspectBlock *bl = &blocks[r * stride + c];
+            ibuf_puts(b, "[");
+            ibuf_int(b, bl->mv_x[0]); ibuf_puts(b, ",");
+            ibuf_int(b, bl->mv_y[0]); ibuf_puts(b, ",");
+            ibuf_int(b, bl->mv_x[1]); ibuf_puts(b, ",");
+            ibuf_int(b, bl->mv_y[1]);
+            ibuf_puts(b, c < w4 - 1 ? "]," : "]");
+        }
+        ibuf_puts(b, r < h4 - 1 ? "]," : "]");
+    }
+    ibuf_puts(b, "],\n");
+
+    /* referenceFrameMap (static) */
+    ibuf_puts(b, "  \"referenceFrameMap\": {\"INTRA_FRAME\":0,\"LAST_FRAME\":1,"
+              "\"LAST2_FRAME\":2,\"LAST3_FRAME\":3,\"GOLDEN_FRAME\":4,"
+              "\"BWDREF_FRAME\":5,\"ALTREF2_FRAME\":6,\"ALTREF_FRAME\":7},\n");
+
+    /* referenceFrame */
+    ibuf_puts(b, "  \"referenceFrame\": [");
+    for (int r = 0; r < h4; r++) {
+        ibuf_puts(b, "[");
+        for (int c = 0; c < w4; c++) {
+            const Dav1dInspectBlock *bl = &blocks[r * stride + c];
+            int ref0, ref1;
+            if (bl->is_intra) {
+                ref0 = 0;  /* INTRA_FRAME */
+                ref1 = -1;
+            } else {
+                /* dav1d ref[0] is 0-indexed (0=LAST..6=ALTREF) -> libaom is 1-indexed */
+                ref0 = bl->ref_type[0] + 1;
+                ref1 = bl->ref_type[1] >= 0 ? bl->ref_type[1] + 1 : -1;
+            }
+            ibuf_puts(b, "[");
+            ibuf_int(b, ref0); ibuf_puts(b, ",");
+            ibuf_int(b, ref1);
+            ibuf_puts(b, c < w4 - 1 ? "]," : "]");
+        }
+        ibuf_puts(b, r < h4 - 1 ? "]," : "]");
+    }
+    ibuf_puts(b, "],\n");
+
+    /* bits - approximate bits per 4x4 block */
+    ibuf_puts(b, "  \"bits\": [");
+    for (int r = 0; r < h4; r++) {
+        ibuf_puts(b, "[");
+        for (int c = 0; c < w4; c++) {
+            const Dav1dInspectBlock *bl = &blocks[r * stride + c];
+            ibuf_float(b, bl->bits);
+            ibuf_puts(b, c < w4 - 1 ? "," : "");
+        }
+        ibuf_puts(b, r < h4 - 1 ? "]," : "]");
+    }
+    ibuf_puts(b, "],\n");
+}
+
+/*
+ * Write RLE-compressed JSON for one frame — matches S1_C1_E103_V0253.json format.
+ * Within each row, consecutive identical values are collapsed: value,[count].
+ * The count means "repeat this value count more times" (so total = count+1).
+ */
+static void write_json_rle(InspectBuf *b, const Dav1dInspectFrameCtx *ctx)
+{
+    const int w4 = ctx->w4;
+    const int h4 = ctx->h4;
+    const ptrdiff_t stride = ctx->b4_stride;
+    const Dav1dInspectBlock *blocks = ctx->blocks;
+
+    /* blockSizeMap (static) */
+    ibuf_puts(b, "  \"blockSizeMap\": {\"BLOCK_4X4\":0,\"BLOCK_4X8\":1,\"BLOCK_8X4\":2,"
+              "\"BLOCK_8X8\":3,\"BLOCK_8X16\":4,\"BLOCK_16X8\":5,\"BLOCK_16X16\":6,"
+              "\"BLOCK_16X32\":7,\"BLOCK_32X16\":8,\"BLOCK_32X32\":9,\"BLOCK_32X64\":10,"
+              "\"BLOCK_64X32\":11,\"BLOCK_64X64\":12,\"BLOCK_64X128\":13,"
+              "\"BLOCK_128X64\":14,\"BLOCK_128X128\":15,\"BLOCK_4X16\":16,"
+              "\"BLOCK_16X4\":17,\"BLOCK_8X32\":18,\"BLOCK_32X8\":19,"
+              "\"BLOCK_16X64\":20,\"BLOCK_64X16\":21},\n");
+
+    /* blockSize — RLE per row */
+    ibuf_puts(b, "  \"blockSize\": [");
+    for (int r = 0; r < h4; r++) {
+        ibuf_puts(b, "[");
+        int c = 0;
+        int first_in_row = 1;
+        while (c < w4) {
+            const uint8_t aom_bs = dav1d_bs_to_aom_bs[blocks[r * stride + c].block_size];
+            int run = 1;
+            while (c + run < w4 &&
+                   dav1d_bs_to_aom_bs[blocks[r * stride + c + run].block_size] == aom_bs)
+                run++;
+            if (!first_in_row) ibuf_puts(b, ",");
+            first_in_row = 0;
+            ibuf_int(b, aom_bs);
+            if (run > 1) {
+                ibuf_puts(b, ",[");
+                ibuf_int(b, run - 1);
+                ibuf_puts(b, "]");
+            }
+            c += run;
+        }
+        ibuf_puts(b, r < h4 - 1 ? "]," : "]");
+    }
+    ibuf_puts(b, "],\n");
+
+    /* motionVectors — RLE per row */
+    ibuf_puts(b, "  \"motionVectors\": [");
+    for (int r = 0; r < h4; r++) {
+        ibuf_puts(b, "[");
+        int c = 0;
+        int first_in_row = 1;
+        while (c < w4) {
+            const Dav1dInspectBlock *bl = &blocks[r * stride + c];
+            const int16_t mx0 = bl->mv_x[0], my0 = bl->mv_y[0];
+            const int16_t mx1 = bl->mv_x[1], my1 = bl->mv_y[1];
+            int run = 1;
+            while (c + run < w4) {
+                const Dav1dInspectBlock *bn = &blocks[r * stride + c + run];
+                if (bn->mv_x[0] != mx0 || bn->mv_y[0] != my0 ||
+                    bn->mv_x[1] != mx1 || bn->mv_y[1] != my1) break;
+                run++;
+            }
+            if (!first_in_row) ibuf_puts(b, ",");
+            first_in_row = 0;
+            ibuf_puts(b, "[");
+            ibuf_int(b, mx0); ibuf_puts(b, ",");
+            ibuf_int(b, my0); ibuf_puts(b, ",");
+            ibuf_int(b, mx1); ibuf_puts(b, ",");
+            ibuf_int(b, my1); ibuf_puts(b, "]");
+            if (run > 1) {
+                ibuf_puts(b, ",[");
+                ibuf_int(b, run - 1);
+                ibuf_puts(b, "]");
+            }
+            c += run;
+        }
+        ibuf_puts(b, r < h4 - 1 ? "]," : "]");
+    }
+    ibuf_puts(b, "],\n");
+
+    /* referenceFrameMap (static) */
+    ibuf_puts(b, "  \"referenceFrameMap\": {\"INTRA_FRAME\":0,\"LAST_FRAME\":1,"
+              "\"LAST2_FRAME\":2,\"LAST3_FRAME\":3,\"GOLDEN_FRAME\":4,"
+              "\"BWDREF_FRAME\":5,\"ALTREF2_FRAME\":6,\"ALTREF_FRAME\":7},\n");
+
+    /* referenceFrame — RLE per row */
+    ibuf_puts(b, "  \"referenceFrame\": [");
+    for (int r = 0; r < h4; r++) {
+        ibuf_puts(b, "[");
+        int c = 0;
+        int first_in_row = 1;
+        while (c < w4) {
+            const Dav1dInspectBlock *bl = &blocks[r * stride + c];
+            int ref0, ref1;
+            if (bl->is_intra) {
+                ref0 = 0; ref1 = -1;
+            } else {
+                ref0 = bl->ref_type[0] + 1;
+                ref1 = bl->ref_type[1] >= 0 ? bl->ref_type[1] + 1 : -1;
+            }
+            int run = 1;
+            while (c + run < w4) {
+                const Dav1dInspectBlock *bn = &blocks[r * stride + c + run];
+                int r0, r1;
+                if (bn->is_intra) { r0 = 0; r1 = -1; }
+                else { r0 = bn->ref_type[0] + 1; r1 = bn->ref_type[1] >= 0 ? bn->ref_type[1] + 1 : -1; }
+                if (r0 != ref0 || r1 != ref1) break;
+                run++;
+            }
+            if (!first_in_row) ibuf_puts(b, ",");
+            first_in_row = 0;
+            ibuf_puts(b, "[");
+            ibuf_int(b, ref0); ibuf_puts(b, ",");
+            ibuf_int(b, ref1); ibuf_puts(b, "]");
+            if (run > 1) {
+                ibuf_puts(b, ",[");
+                ibuf_int(b, run - 1);
+                ibuf_puts(b, "]");
+            }
+            c += run;
+        }
+        ibuf_puts(b, r < h4 - 1 ? "]," : "]");
+    }
+    ibuf_puts(b, "],\n");
+
+    /* bits — RLE per row (approximate bits per 4x4 block) */
+    ibuf_puts(b, "  \"bits\": [");
+    for (int r = 0; r < h4; r++) {
+        ibuf_puts(b, "[");
+        int c = 0;
+        int first_in_row = 1;
+        while (c < w4) {
+            const float bits_val = blocks[r * stride + c].bits;
+            int run = 1;
+            while (c + run < w4) {
+                const float next_bits = blocks[r * stride + c + run].bits;
+                /* Compare floats with small epsilon for RLE grouping */
+                if (fabsf(next_bits - bits_val) > 0.01f) break;
+                run++;
+            }
+            if (!first_in_row) ibuf_puts(b, ",");
+            first_in_row = 0;
+            ibuf_float(b, bits_val);
+            if (run > 1) {
+                ibuf_puts(b, ",[");
+                ibuf_int(b, run - 1);
+                ibuf_puts(b, "]");
+            }
+            c += run;
+        }
+        ibuf_puts(b, r < h4 - 1 ? "]," : "]");
+    }
+    ibuf_puts(b, "],\n");
+}
+
+/* Write frame-level metadata fields (common to both formats) */
+static void write_json_frame_meta(InspectBuf *b, const Dav1dInspectFrameCtx *ctx)
+{
+    ibuf_puts(b, "  \"frame\": ");   ibuf_int(b, (int)ctx->decode_idx);  ibuf_puts(b, ",\n");
+    ibuf_puts(b, "  \"showFrame\": "); ibuf_int(b, ctx->show_frame);      ibuf_puts(b, ",\n");
+    ibuf_puts(b, "  \"frameType\": "); ibuf_int(b, ctx->frame_type);      ibuf_puts(b, ",\n");
+    ibuf_puts(b, "  \"baseQIndex\": "); ibuf_int(b, ctx->base_q_idx);     ibuf_puts(b, ",\n");
+    ibuf_puts(b, "  \"tileCols\": ");  ibuf_int(b, ctx->w4);              ibuf_puts(b, ",\n");
+    ibuf_puts(b, "  \"tileRows\": ");  ibuf_int(b, ctx->h4);              ibuf_puts(b, ",\n");
+    ibuf_puts(b, "  \"deltaQPresentFlag\": "); ibuf_int(b, ctx->delta_q_present); ibuf_puts(b, ",\n");
+    ibuf_puts(b, "  \"deltaQRes\": ");  ibuf_int(b, ctx->delta_q_res);    ibuf_puts(b, ",\n");
+    ibuf_puts(b, "  \"config\": {\"MI_SIZE\":4},\n");
+    ibuf_puts(b, "  \"configString\": \"dav1d\"\n");
+}
+
+/* Save one frame as JSON to disk */
+static void save_inspect_json(const Dav1dFrameContext *f)
+{
+    if (!f->inspect || !f->inspect->out_dir) return;
+    const char *out = f->inspect->out_dir;
+    (void)mkdir(out, 0755);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/frame_%u.json", out, f->inspect->decode_idx);
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+
+    InspectBuf b;
+    ibuf_init(&b, fp, 1 << 20);  /* 1 MB initial buffer */
+
+    ibuf_puts(&b, "{\n");
+
+    if (f->inspect->use_rle)
+        write_json_rle(&b, f->inspect);
+    else
+        write_json_flat(&b, f->inspect);
+
+    write_json_frame_meta(&b, f->inspect);
+
+    ibuf_puts(&b, "}\n");
+
+    ibuf_free(&b);
+    fclose(fp);
+}
+
+/* Persist per-frame residual planes to disk (binary format).
+ * Each plane is saved as: header (int32 width, int32 height) followed by
+ * row-major int16 pixel values.
+ */
+static void save_inspect_residual(const Dav1dFrameContext *f)
+{
+    if (!f->inspect || !f->inspect->out_dir || !f->inspect->enable_residual) return;
+    const char *out = f->inspect->out_dir;
+    const char *plane_names[3] = { "Y", "U", "V" };
+
+    for (int pl = 0; pl < 3; pl++) {
+        if (!f->inspect->residual[pl]) continue;
+        const int w = (pl > 0) ? f->inspect->res_cw : f->inspect->res_w;
+        const int h = (pl > 0) ? f->inspect->res_ch : f->inspect->res_h;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/frame_%u_residual_%s.bin",
+                 out, f->inspect->decode_idx, plane_names[pl]);
+
+        FILE *fp = fopen(path, "wb");
+        if (!fp) continue;
+
+        int32_t hdr[2] = { w, h };
+        fwrite(hdr, sizeof(hdr), 1, fp);
+        fwrite(f->inspect->residual[pl], sizeof(int16_t), (size_t)w * h, fp);
+        fclose(fp);
+    }
+}
+#endif /* CONFIG_INSPECT */
 
 static void init_quant_tables(const Dav1dSequenceHeader *const seq_hdr,
                               const Dav1dFrameHeader *const frame_hdr,
@@ -702,6 +1125,16 @@ static int decode_b(Dav1dTaskContext *const t,
     const int has_chroma = f->cur.p.layout != DAV1D_PIXEL_LAYOUT_I400 &&
                            (bw4 > ss_hor || t->bx & 1) &&
                            (bh4 > ss_ver || t->by & 1);
+
+#if CONFIG_INSPECT
+    /* snapshot MSAC state before any entropy decoding */
+    const uint8_t *inspect_msac_pos = NULL;
+    int inspect_msac_cnt = 0;
+    if (f->inspect && t->frame_thread.pass != 2) {
+        inspect_msac_pos = ts->msac.buf_pos;
+        inspect_msac_cnt = ts->msac.cnt;
+    }
+#endif
 
     if (t->frame_thread.pass == 2) {
         if (b->intra) {
@@ -2058,6 +2491,55 @@ static int decode_b(Dav1dTaskContext *const t,
         }
     }
 
+    /* populate inspection block metadata (per-4x4) */
+#if CONFIG_INSPECT
+    if (f->inspect) {
+        const int iw4 = imin(bw4, f->bw - t->bx);
+        const int ih4 = imin(bh4, f->bh - t->by);
+
+        /* compute approximate bit cost from MSAC state delta */
+        float bits_per_b4 = 0.0f;
+        if (inspect_msac_pos && t->frame_thread.pass != 2) {
+            const float block_bits =
+                (float)(ts->msac.buf_pos - inspect_msac_pos) * 8.0f
+                + (float)(inspect_msac_cnt - ts->msac.cnt);
+            bits_per_b4 = block_bits / (float)(bw4 * bh4);
+        }
+
+        for (int yy = 0; yy < ih4; yy++) {
+            for (int xx = 0; xx < iw4; xx++) {
+                const ptrdiff_t idx = (t->by + yy) * f->b4_stride + (t->bx + xx);
+                Dav1dInspectBlock *ib = &f->inspect->blocks[idx];
+                ib->is_intra = b->intra ? 1 : 0;
+                ib->block_size = (uint8_t) bs;
+                ib->skip = b->skip ? 1 : 0;
+                if (!b->intra) {
+                    ib->ref_type[0] = (int8_t) b->ref[0];
+                    ib->ref_type[1] = (int8_t) (b->ref[1] >= 0 ? b->ref[1] : -1);
+                    if (b->ref[0] >= 0) ib->ref_poc[0] = f->refpoc[b->ref[0]];
+                    else ib->ref_poc[0] = 0;
+                    if (b->ref[1] >= 0) ib->ref_poc[1] = f->refpoc[b->ref[1]];
+                    else ib->ref_poc[1] = 0;
+                    ib->mv_x[0] = b->mv[0].x;
+                    ib->mv_y[0] = b->mv[0].y;
+                    ib->mv_x[1] = b->mv[1].x;
+                    ib->mv_y[1] = b->mv[1].y;
+                    ib->inter_mode = (uint8_t) b->inter_mode;
+                    ib->comp_type = (uint8_t) b->comp_type;
+                } else {
+                    ib->ref_type[0] = -1;
+                    ib->ref_type[1] = -1;
+                    ib->ref_poc[0] = ib->ref_poc[1] = 0;
+                    ib->mv_x[0] = ib->mv_y[0] = ib->mv_x[1] = ib->mv_y[1] = 0;
+                    ib->inter_mode = 0;
+                    ib->comp_type = 0;
+                }
+                ib->bits = bits_per_b4;
+            }
+        }
+    }
+#endif
+
     return 0;
 }
 
@@ -3280,6 +3762,22 @@ void dav1d_decode_frame_exit(Dav1dFrameContext *const f, int retval) {
     for (int i = 0; i < f->n_tile_data; i++)
         dav1d_data_unref_internal(&f->tile[i].data);
     f->task_thread.retval = retval;
+
+#if CONFIG_INSPECT
+    if (f->inspect) {
+        if (f->c->inspect_callback) {
+            f->c->inspect_callback(f->c->inspect_cookie, f->inspect);
+        }
+        save_inspect_json(f);
+        save_inspect_residual(f);
+        if (f->inspect->blocks) dav1d_free(f->inspect->blocks);
+        for (int i = 0; i < 3; i++)
+            if (f->inspect->residual[i]) dav1d_free(f->inspect->residual[i]);
+        if (f->inspect->out_dir) free(f->inspect->out_dir);
+        dav1d_free(f->inspect);
+        f->inspect = NULL;
+    }
+#endif
 }
 
 int dav1d_decode_frame(Dav1dFrameContext *const f) {
@@ -3566,6 +4064,63 @@ int dav1d_submit_frame(Dav1dContext *const c) {
     const int rows = f->frame_hdr->tiling.rows;
     atomic_store(&f->task_thread.task_counter,
                  (cols * rows + f->sbh) << uses_2pass);
+
+    /* optional inspection allocation (enabled via DAV1D_INSPECT_DIR env var) */
+#if CONFIG_INSPECT
+    if (!f->inspect) {
+        const char *env = f->c->inspect_output ? f->c->inspect_output : getenv("DAV1D_INSPECT_DIR");
+        if (env || f->c->inspect_callback) {
+            f->inspect = dav1d_malloc(ALLOC_TILE, sizeof(*f->inspect));
+            if (f->inspect) {
+                memset(f->inspect, 0, sizeof(*f->inspect));
+                f->inspect->decode_idx = c->inspect_frame_counter++;
+                f->inspect->w4 = f->w4;
+                f->inspect->h4 = f->h4;
+                f->inspect->b4_stride = f->b4_stride;
+                /* allocate using bh (>= h4) since block iterations use bh */
+                const size_t nb = (size_t)f->bh * f->b4_stride;
+                f->inspect->blocks = dav1d_malloc(ALLOC_BLOCK, nb * sizeof(*f->inspect->blocks));
+                if (f->inspect->blocks)
+                    memset(f->inspect->blocks, 0, nb * sizeof(*f->inspect->blocks));
+                f->inspect->out_dir = env ? strdup(env) : NULL;
+                f->inspect->frame_offset = f->frame_hdr->frame_offset;
+                f->inspect->frame_type = f->frame_hdr->frame_type;
+                f->inspect->show_frame = f->frame_hdr->show_frame;
+                f->inspect->base_q_idx = f->frame_hdr->quant.yac;
+                f->inspect->delta_q_present = f->frame_hdr->delta.q.present;
+                f->inspect->delta_q_res = 1u << f->frame_hdr->delta.q.res_log2;
+                f->inspect->enable_residual = (uint8_t)c->inspect_residual;
+                f->inspect->use_rle = (uint8_t)c->inspect_compress;
+                for (int i = 0; i < 7; i++) f->inspect->refpoc[i] = f->refpoc[i];
+
+                /* allocate residual planes (only if enabled) */
+                if (f->inspect->enable_residual) {
+                    const int ss_hor = f->cur.p.layout != DAV1D_PIXEL_LAYOUT_I444;
+                    const int ss_ver = f->cur.p.layout == DAV1D_PIXEL_LAYOUT_I420;
+                    f->inspect->res_w = f->cur.p.w;
+                    f->inspect->res_h = f->cur.p.h;
+                    f->inspect->ss_hor = ss_hor;
+                    f->inspect->ss_ver = ss_ver;
+                    f->inspect->res_cw = (f->cur.p.w + ss_hor) >> ss_hor;
+                    f->inspect->res_ch = (f->cur.p.h + ss_ver) >> ss_ver;
+                    const size_t luma_sz = (size_t)f->inspect->res_w * f->inspect->res_h;
+                    const size_t chroma_sz = (size_t)f->inspect->res_cw * f->inspect->res_ch;
+                    f->inspect->residual[0] = dav1d_malloc(ALLOC_BLOCK, luma_sz * sizeof(int16_t));
+                    if (f->inspect->residual[0])
+                        memset(f->inspect->residual[0], 0, luma_sz * sizeof(int16_t));
+                    if (f->cur.p.layout != DAV1D_PIXEL_LAYOUT_I400) {
+                        f->inspect->residual[1] = dav1d_malloc(ALLOC_BLOCK, chroma_sz * sizeof(int16_t));
+                        f->inspect->residual[2] = dav1d_malloc(ALLOC_BLOCK, chroma_sz * sizeof(int16_t));
+                        if (f->inspect->residual[1])
+                            memset(f->inspect->residual[1], 0, chroma_sz * sizeof(int16_t));
+                        if (f->inspect->residual[2])
+                            memset(f->inspect->residual[2], 0, chroma_sz * sizeof(int16_t));
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     // ref_mvs
     if (IS_INTER_OR_SWITCH(f->frame_hdr) || f->frame_hdr->allow_intrabc) {

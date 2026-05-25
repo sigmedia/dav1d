@@ -63,6 +63,9 @@ enum {
     ARG_OUTPUT_INVISIBLE,
     ARG_INLOOP_FILTERS,
     ARG_DECODE_FRAME_TYPE,
+    ARG_INSPECT_DIR,
+    ARG_INSPECT_RESIDUAL,
+    ARG_INSPECT_COMPRESS,
 };
 
 static const struct option long_opts[] = {
@@ -90,7 +93,10 @@ static const struct option long_opts[] = {
     { "outputinvisible", 1, NULL, ARG_OUTPUT_INVISIBLE },
     { "inloopfilters",   1, NULL, ARG_INLOOP_FILTERS },
     { "decodeframetype", 1, NULL, ARG_DECODE_FRAME_TYPE },
-    { NULL,              0, NULL, 0 },
+    { "inspect-dir",         1, NULL, ARG_INSPECT_DIR },
+    { "inspect-residual",    0, NULL, ARG_INSPECT_RESIDUAL },
+    { "inspect-compress",    0, NULL, ARG_INSPECT_COMPRESS },
+    { NULL,                  0, NULL, 0 },
 };
 
 #if HAVE_XXHASH_H
@@ -432,6 +438,27 @@ void parse(const int argc, char *const *const argv,
             lib_settings->decode_frame_type =
                 parse_enum(optarg, decode_frame_type_tbl,
                            ARRAY_SIZE(decode_frame_type_tbl), ARG_DECODE_FRAME_TYPE, argv[0]);
+            break;
+        case ARG_INSPECT_DIR:
+#if CONFIG_INSPECT
+            lib_settings->inspect_output = optarg;
+#else
+            fprintf(stderr, "Warning: --inspect-dir ignored (CONFIG_INSPECT disabled)\n");
+#endif
+            break;
+        case ARG_INSPECT_RESIDUAL:
+#if CONFIG_INSPECT
+            lib_settings->inspect_residual = 1;
+#else
+            fprintf(stderr, "Warning: --inspect-residual ignored (CONFIG_INSPECT disabled)\n");
+#endif
+            break;
+        case ARG_INSPECT_COMPRESS:
+#if CONFIG_INSPECT
+            lib_settings->inspect_compress = 1;
+#else
+            fprintf(stderr, "Warning: --inspect-compress ignored (CONFIG_INSPECT disabled)\n");
+#endif
             break;
         default:
             usage(argv[0], NULL);

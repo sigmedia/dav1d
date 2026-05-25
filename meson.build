@@ -86,6 +86,9 @@ cdata.set10('TRIM_DSP_FUNCTIONS', get_option('trim_dsp') == 'true' or
 # Logging option
 cdata.set10('CONFIG_LOG', get_option('logging'))
 
+# Inspection option
+cdata.set10('CONFIG_INSPECT', get_option('enable_inspect'))
+
 #
 # OS/Compiler checks and defines
 #

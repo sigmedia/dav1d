@@ -53,6 +53,9 @@ typedef struct Dav1dTask Dav1dTask;
 #include "src/looprestoration.h"
 #include "src/mc.h"
 #include "src/msac.h"
+#if CONFIG_INSPECT
+#include "src/inspect_data.h"
+#endif
 #include "src/pal.h"
 #include "src/picture.h"
 #include "src/recon.h"
@@ -196,6 +199,15 @@ struct Dav1dContext {
     int cached_error;
 
     Dav1dLogger logger;
+    /* optional inspection output directory (owned by context) */
+#if CONFIG_INSPECT
+    char *inspect_output;
+    unsigned inspect_frame_counter;
+    int inspect_residual;
+    int inspect_compress;
+    void (*inspect_callback)(void *cookie, void *inspect_ctx);
+    void *inspect_cookie;
+#endif
 
     Dav1dMemPool *picture_pool;
     Dav1dMemPool *pic_ctx_pool;
@@ -241,6 +253,9 @@ struct Dav1dFrameContext {
     int resize_step[2 /* y, uv */], resize_start[2 /* y, uv */];
 
     const Dav1dContext *c;
+#if CONFIG_INSPECT
+    Dav1dInspectFrameCtx *inspect;
+#endif
     Dav1dTileState *ts;
     int n_ts;
     const Dav1dDSPContext *dsp;

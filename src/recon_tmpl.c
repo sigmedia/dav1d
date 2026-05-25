@@ -45,6 +45,69 @@
 #include "src/scan.h"
 #include "src/tables.h"
 #include "src/wedge.h"
+#if CONFIG_INSPECT
+#include "src/inspect_data.h"
+#endif
+
+#if CONFIG_INSPECT
+/*
+ * Helper: capture residual = reconstruction - prediction.
+ * Called after itxfm_add has added the inverse-transformed residual to dst.
+ * pred_snap contains the prediction pixels saved before itxfm_add.
+ * Writes the difference into the inspect residual plane.
+ */
+static inline void inspect_capture_residual(
+    const Dav1dFrameContext *const f,
+    const pixel *dst, const ptrdiff_t stride,
+    const int16_t *pred_snap,
+    const int tx_w, const int tx_h,
+    const int plane, const int px, const int py)
+{
+    if (!f->inspect || !f->inspect->enable_residual) return;
+    int16_t *const res_plane = f->inspect->residual[plane];
+    if (!res_plane) return;
+    const int res_stride = (plane > 0) ? f->inspect->res_cw : f->inspect->res_w;
+    const int max_x = (plane > 0) ? f->inspect->res_cw : f->inspect->res_w;
+    const int max_y = (plane > 0) ? f->inspect->res_ch : f->inspect->res_h;
+    if (px < 0 || py < 0 || px >= max_x || py >= max_y) return;
+    /* Precompute clamped extents to avoid per-pixel bounds checks */
+    const int ew = imin(tx_w, max_x - px);
+    const int eh = imin(tx_h, max_y - py);
+    const ptrdiff_t pxstride = PXSTRIDE(stride);
+    for (int yy = 0; yy < eh; yy++) {
+        int16_t *res_row = &res_plane[(py + yy) * res_stride + px];
+        const pixel *dst_row = &dst[yy * pxstride];
+        const int16_t *snap_row = &pred_snap[yy * tx_w];
+        for (int xx = 0; xx < ew; xx++)
+            res_row[xx] = (int16_t)((int)dst_row[xx] - (int)snap_row[xx]);
+    }
+}
+
+/*
+ * Helper: snapshot prediction pixels before itxfm_add.
+ * Saves the current dst contents to pred_snap (must be at least tx_w*tx_h).
+ */
+static inline void inspect_snapshot_pred(
+    const pixel *dst, const ptrdiff_t stride,
+    int16_t *pred_snap, const int tx_w, const int tx_h)
+{
+    const ptrdiff_t pxstride = PXSTRIDE(stride);
+    if (sizeof(pixel) == sizeof(int16_t)) {
+        /* 16-bit path: pixel is int16_t-sized, direct row copy */
+        for (int yy = 0; yy < tx_h; yy++)
+            memcpy(&pred_snap[yy * tx_w], &dst[yy * pxstride],
+                   tx_w * sizeof(int16_t));
+    } else {
+        /* 8-bit path: widen uint8_t -> int16_t */
+        for (int yy = 0; yy < tx_h; yy++) {
+            const pixel *src_row = &dst[yy * pxstride];
+            int16_t *dst_row = &pred_snap[yy * tx_w];
+            for (int xx = 0; xx < tx_w; xx++)
+                dst_row[xx] = (int16_t)src_row[xx];
+        }
+    }
+}
+#endif /* CONFIG_INSPECT */
 
 static inline unsigned read_golomb(MsacContext *const msac) {
     int len = 0;
@@ -812,8 +875,23 @@ static void read_coef_tree(Dav1dTaskContext *const t,
             if (eob >= 0) {
                 if (DEBUG_BLOCK_INFO && DEBUG_B_PIXELS)
                     coef_dump(cf, imin(t_dim->h, 8) * 4, imin(t_dim->w, 8) * 4, 3, "dq");
+#if CONFIG_INSPECT
+                int16_t *pred_snap = NULL;
+                int16_t pred_snap_buf[64 * 64];
+                if (f->inspect && f->inspect->enable_residual) {
+                    pred_snap = pred_snap_buf;
+                    inspect_snapshot_pred(dst, f->cur.stride[0],
+                                          pred_snap, t_dim->w * 4, t_dim->h * 4);
+                }
+#endif
                 dsp->itx.itxfm_add[ytx][txtp](dst, f->cur.stride[0], cf, eob
                                               HIGHBD_CALL_SUFFIX);
+#if CONFIG_INSPECT
+                if (pred_snap)
+                    inspect_capture_residual(f, dst, f->cur.stride[0],
+                                             pred_snap, t_dim->w * 4, t_dim->h * 4,
+                                             0, t->bx * 4, t->by * 4);
+#endif
                 if (DEBUG_BLOCK_INFO && DEBUG_B_PIXELS)
                     hex_dump(dst, f->cur.stride[0], t_dim->w * 4, t_dim->h * 4, "recon");
             }
@@ -1317,10 +1395,25 @@ void bytefn(dav1d_recon_b_intra)(Dav1dTaskContext *const t, const enum BlockSize
                             if (DEBUG_BLOCK_INFO && DEBUG_B_PIXELS)
                                 coef_dump(cf, imin(t_dim->h, 8) * 4,
                                           imin(t_dim->w, 8) * 4, 3, "dq");
+#if CONFIG_INSPECT
+                            int16_t *pred_snap = NULL;
+                            int16_t pred_snap_buf[64 * 64];
+                            if (f->inspect && f->inspect->enable_residual) {
+                                pred_snap = pred_snap_buf;
+                                inspect_snapshot_pred(dst, f->cur.stride[0],
+                                                      pred_snap, t_dim->w * 4, t_dim->h * 4);
+                            }
+#endif
                             dsp->itx.itxfm_add[b->tx]
                                               [txtp](dst,
                                                      f->cur.stride[0],
                                                      cf, eob HIGHBD_CALL_SUFFIX);
+#if CONFIG_INSPECT
+                            if (pred_snap)
+                                inspect_capture_residual(f, dst, f->cur.stride[0],
+                                                         pred_snap, t_dim->w * 4, t_dim->h * 4,
+                                                         0, t->bx * 4, t->by * 4);
+#endif
                             if (DEBUG_BLOCK_INFO && DEBUG_B_PIXELS)
                                 hex_dump(dst, f->cur.stride[0],
                                          t_dim->w * 4, t_dim->h * 4, "recon");
@@ -1533,9 +1626,26 @@ void bytefn(dav1d_recon_b_intra)(Dav1dTaskContext *const t, const enum BlockSize
                                 if (DEBUG_BLOCK_INFO && DEBUG_B_PIXELS)
                                     coef_dump(cf, uv_t_dim->h * 4,
                                               uv_t_dim->w * 4, 3, "dq");
+#if CONFIG_INSPECT
+                                int16_t *pred_snap = NULL;
+                                int16_t pred_snap_buf[64 * 64];
+                                if (f->inspect && f->inspect->enable_residual) {
+                                    pred_snap = pred_snap_buf;
+                                    inspect_snapshot_pred(dst, stride,
+                                                          pred_snap, uv_t_dim->w * 4, uv_t_dim->h * 4);
+                                }
+#endif
                                 dsp->itx.itxfm_add[b->uvtx]
                                                   [txtp](dst, stride,
                                                          cf, eob HIGHBD_CALL_SUFFIX);
+#if CONFIG_INSPECT
+                                if (pred_snap)
+                                    inspect_capture_residual(f, dst, stride,
+                                                             pred_snap, uv_t_dim->w * 4, uv_t_dim->h * 4,
+                                                             1 + pl,
+                                                             (t->bx >> ss_hor) * 4,
+                                                             (t->by >> ss_ver) * 4);
+#endif
                                 if (DEBUG_BLOCK_INFO && DEBUG_B_PIXELS)
                                     hex_dump(dst, stride, uv_t_dim->w * 4,
                                              uv_t_dim->h * 4, "recon");
@@ -1561,6 +1671,7 @@ int bytefn(dav1d_recon_b_inter)(Dav1dTaskContext *const t, const enum BlockSize 
     const Dav1dFrameContext *const f = t->f;
     const Dav1dDSPContext *const dsp = f->dsp;
     const int bx4 = t->bx & 31, by4 = t->by & 31;
+    const int inspect_bx = t->bx, inspect_by = t->by; /* save for residual capture */
     const int ss_ver = f->cur.p.layout == DAV1D_PIXEL_LAYOUT_I420;
     const int ss_hor = f->cur.p.layout != DAV1D_PIXEL_LAYOUT_I444;
     const int cbx4 = bx4 >> ss_hor, cby4 = by4 >> ss_ver;
@@ -1963,10 +2074,27 @@ int bytefn(dav1d_recon_b_inter)(Dav1dTaskContext *const t, const enum BlockSize 
                         if (eob >= 0) {
                             if (DEBUG_BLOCK_INFO && DEBUG_B_PIXELS)
                                 coef_dump(cf, uvtx->h * 4, uvtx->w * 4, 3, "dq");
+#if CONFIG_INSPECT
+                            int16_t *pred_snap = NULL;
+                            int16_t pred_snap_buf[64 * 64];
+                            if (f->inspect && f->inspect->enable_residual) {
+                                pred_snap = pred_snap_buf;
+                                inspect_snapshot_pred(&uvdst[4 * x], f->cur.stride[1],
+                                                      pred_snap, uvtx->w * 4, uvtx->h * 4);
+                            }
+#endif
                             dsp->itx.itxfm_add[b->uvtx]
                                               [txtp](&uvdst[4 * x],
                                                      f->cur.stride[1],
                                                      cf, eob HIGHBD_CALL_SUFFIX);
+#if CONFIG_INSPECT
+                            if (pred_snap)
+                                inspect_capture_residual(f, &uvdst[4 * x], f->cur.stride[1],
+                                                         pred_snap, uvtx->w * 4, uvtx->h * 4,
+                                                         1 + pl,
+                                                         ((inspect_bx >> ss_hor) + x) * 4,
+                                                         ((inspect_by >> ss_ver) + y) * 4);
+#endif
                             if (DEBUG_BLOCK_INFO && DEBUG_B_PIXELS)
                                 hex_dump(&uvdst[4 * x], f->cur.stride[1],
                                          uvtx->w * 4, uvtx->h * 4, "recon");

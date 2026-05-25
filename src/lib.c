@@ -84,6 +84,13 @@ COLD void dav1d_default_settings(Dav1dSettings *const s) {
     s->output_invisible_frames = 0;
     s->inloop_filters = DAV1D_INLOOPFILTER_ALL;
     s->decode_frame_type = DAV1D_DECODEFRAMETYPE_ALL;
+#if CONFIG_INSPECT
+    s->inspect_output = NULL;
+    s->inspect_residual = 0;
+    s->inspect_compress = 0;
+    s->inspect_callback = NULL;
+    s->inspect_cookie = NULL;
+#endif
 }
 
 static void close_internal(Dav1dContext **const c_out, int flush);
@@ -176,6 +183,16 @@ COLD int dav1d_open(Dav1dContext **const c_out, const Dav1dSettings *const s) {
     c->output_invisible_frames = s->output_invisible_frames;
     c->inloop_filters = s->inloop_filters;
     c->decode_frame_type = s->decode_frame_type;
+#if CONFIG_INSPECT
+    /* copy inspect output path if provided */
+    if (s->inspect_output) c->inspect_output = strdup(s->inspect_output);
+    else c->inspect_output = NULL;
+    c->inspect_frame_counter = 0;
+    c->inspect_residual = s->inspect_residual;
+    c->inspect_compress = s->inspect_compress;
+    c->inspect_callback = s->inspect_callback;
+    c->inspect_cookie = s->inspect_cookie;
+#endif
 
     dav1d_data_props_set_defaults(&c->cached_error_props);
 
@@ -700,6 +717,13 @@ static COLD void close_internal(Dav1dContext **const c_out, int flush) {
     dav1d_mem_pool_end(c->cdf_pool);
     dav1d_mem_pool_end(c->picture_pool);
     dav1d_mem_pool_end(c->pic_ctx_pool);
+
+#if CONFIG_INSPECT
+    if (c->inspect_output) {
+        free(c->inspect_output);
+        c->inspect_output = NULL;
+    }
+#endif
 
     dav1d_freep_aligned(c_out);
 }

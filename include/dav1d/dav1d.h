@@ -84,6 +84,11 @@ typedef struct Dav1dSettings {
     unsigned frame_size_limit; ///< maximum frame size, in pixels (0 = unlimited, default 0)
     Dav1dPicAllocator allocator; ///< Picture allocator callback.
     Dav1dLogger logger; ///< Logger callback.
+    const char *inspect_output; ///< optional directory path to write inspection files
+    int inspect_residual; ///< enable residual extraction (default 0)
+    int inspect_compress; ///< use RLE-compressed JSON output (default 0)
+    void (*inspect_callback)(void *cookie, void *inspect_ctx); ///< custom callback for in-memory inspect
+    void *inspect_cookie; ///< cookie for the custom callback
     int strict_std_compliance; ///< whether to abort decoding on standard compliance violations
                                ///< that don't affect actual bitstream decoding (e.g. inconsistent
                                ///< or invalid metadata, default 0)
